@@ -7,6 +7,8 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import { buildVersion, diffVersions, estimateCutTimeSec } from './versions'
+import { DEFAULT_EXPORT_CFG, DEFAULT_SHEET } from './types'
 
 export type CheckResult = {
   id: string
@@ -453,8 +455,122 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     ),
   )
 
+  // ---------- 10. 刀路版本对照：存档 / 差异比对 / 三项差值 ----------
+  checks.push(...runVersionChecks(settings, mat, imported))
+
   const totalMs = performance.now() - t0
   return { checks, summaries, totalMs }
+}
+
+/**
+ * 版本对照自检：用多碎片纹样在两组不同连刀点宽度下各存一版，
+ * 校验快照反推、连刀点差异识别、三项差值与同参数一致性判定。
+ */
+function runVersionChecks(settings: CutSettings, mat: MaterialPreset, imported: Item[]): CheckResult[] {
+  const out: CheckResult[] = []
+  const base = imported.find((x) => x.file === 'petal-scatter.svg')?.shape ?? imported[0]?.shape
+  if (!base) {
+    out.push(ok('version-snapshot', '版本快照包含整场刀路、连刀点与跳刀', false, '没有可用的多轮廓纹样'))
+    return out
+  }
+  const sheet = { ...DEFAULT_SHEET }
+  const mkJob = (s: CutSettings) => {
+    const comp = computeShape(base, s, mat)
+    return buildJob([base], new Map([[base.id, comp]]), [0], { sharedEdge: false, start: { x: 0, y: 0 } })
+  }
+  const sA: CutSettings = { ...settings, bridgeWidthMm: 0.5, bridgeEveryMm: 12 }
+  const sB: CutSettings = { ...settings, bridgeWidthMm: 1.0, bridgeEveryMm: 12 }
+  const jobA = mkJob(sA)
+  const jobB = mkJob(sB)
+  const va = buildVersion({ job: jobA, settings: sA, exportCfg: { ...DEFAULT_EXPORT_CFG }, sheet, material: mat, exportFormat: 'plt' }, 1)
+  const vb = buildVersion({ job: jobB, settings: sB, exportCfg: { ...DEFAULT_EXPORT_CFG }, sheet, material: mat, exportFormat: 'plt' }, 2)
+  if (!va || !vb) {
+    out.push(ok('version-snapshot', '版本快照包含整场刀路、连刀点与跳刀', false, '快照构建返回空'))
+    return out
+  }
+  const snapshotOk =
+    va.stats.runCount === jobA.steps.length &&
+    va.bridges.length === va.stats.bridgeCount &&
+    va.bridges.length > 0 &&
+    va.travels.length >= 1 &&
+    Math.abs(va.stats.cutLengthMm - jobA.cutLengthMm) < 0.5 &&
+    Math.abs(va.stats.travelMm - jobA.travelMm) < 0.5
+  out.push(
+    ok(
+      'version-snapshot',
+      '版本快照：整场刀路 + 切割参数 + 连刀点/跳刀一起冻结',
+      snapshotOk,
+      `A 版 ${va.stats.runCount} 段、${va.bridges.length} 个连刀点、${va.travels.length} 次跳刀｜刀路 ${va.stats.cutLengthMm.toFixed(1)}mm、跳刀 ${va.stats.travelMm.toFixed(1)}mm、预计 ${va.stats.cutTimeSec.toFixed(1)}s`,
+    ),
+  )
+
+  const expectTime = (jobA.cutLengthMm * mat.passes) / mat.speedMmS
+  out.push(
+    ok(
+      'version-cuttime',
+      '预计切割时间 = 刀路总长 × 重复次数 ÷ 速度',
+      Math.abs(estimateCutTimeSec(jobA.cutLengthMm, mat) - expectTime) < 0.2,
+      `${jobA.cutLengthMm.toFixed(1)}mm × ${mat.passes} ÷ ${mat.speedMmS}mm/s = ${expectTime.toFixed(1)}s（快照 ${va.stats.cutTimeSec.toFixed(1)}s）`,
+    ),
+  )
+
+  const d = diffVersions(va, vb)
+  const bridgeChanged =
+    d.bridgeMoved.length + d.bridgeAdded.length + d.bridgeRemoved.length > 0 || d.entries.some((e) => e.kind === 'bridge')
+  const entriesHaveFocus = d.entries.every((e) => Number.isFinite(e.focus.x) && Number.isFinite(e.focus.y))
+  out.push(
+    ok(
+      'version-diff',
+      '版本比对：连刀点变化单列、仅一版段着色归类、差异条目可定位',
+      bridgeChanged && entriesHaveFocus,
+      `连刀点：新增 ${d.bridgeAdded.length} / 消失 ${d.bridgeRemoved.length} / 移位 ${d.bridgeMoved.length}｜` +
+        `仅 A 段 ${d.onlyASegments.length}、仅 B 段 ${d.onlyBSegments.length}｜跳刀变化 ${d.travelAdded.length + d.travelRemoved.length + d.travelRerouted.length}｜` +
+        `清单 ${d.entries.length} 条（全部有定位点 = ${entriesHaveFocus}）`,
+    ),
+  )
+  out.push(
+    ok(
+      'version-delta',
+      '三项差值（刀路总长 / 跳刀总长 / 预计切割时间）计算正确',
+      Math.abs(d.metrics.cutDeltaMm - (vb.stats.cutLengthMm - va.stats.cutLengthMm)) < 0.01 &&
+        Math.abs(d.metrics.travelDeltaMm - (vb.stats.travelMm - va.stats.travelMm)) < 0.01 &&
+        Math.abs(d.metrics.cutTimeDeltaSec - (vb.stats.cutTimeSec - va.stats.cutTimeSec)) < 0.01,
+      `刀路 ${d.metrics.cutDeltaMm.toFixed(1)}mm｜跳刀 ${d.metrics.travelDeltaMm.toFixed(1)}mm｜时间 ${d.metrics.cutTimeDeltaSec.toFixed(1)}s`,
+    ),
+  )
+
+  const va2 = buildVersion({ job: jobA, settings: sA, exportCfg: { ...DEFAULT_EXPORT_CFG }, sheet, material: mat, exportFormat: 'plt' }, 3)
+  const dSame = va2 ? diffVersions(va, va2) : null
+  out.push(
+    ok(
+      'version-identical',
+      '刀路未变时两版判为一致（无误报差异）',
+      !!dSame && dSame.identical,
+      dSame ? (dSame.identical ? '同参数重存：几何 / 连刀点 / 跳刀全部一致' : `误报 ${dSame.entries.length} 条差异`) : '快照失败',
+    ),
+  )
+
+  const sC: CutSettings = {
+    ...settings,
+    bridgeWidthMm: 0.5,
+    travelOptimize: settings.travelOptimize === 'nearest' ? 'nearest_2opt' : 'nearest',
+  }
+  const vc = buildVersion({ job: mkJob(sC), settings: sC, exportCfg: { ...DEFAULT_EXPORT_CFG }, sheet, material: mat, exportFormat: 'plt' }, 4)
+  if (vc) {
+    const dC = diffVersions(va, vc)
+    const segStable = dC.onlyASegments.length === 0 && dC.onlyBSegments.length === 0
+    out.push(
+      ok(
+        'version-travel-only',
+        '只改跳刀优化：切割段不变、跳刀走向变化单独成行',
+        segStable,
+        segStable
+          ? `切割段 0 差异｜跳刀：新增 ${dC.travelAdded.length} / 消失 ${dC.travelRemoved.length} / 走向变化 ${dC.travelRerouted.length}`
+          : `切割段误报：仅A ${dC.onlyASegments.length}、仅B ${dC.onlyBSegments.length}`,
+      ),
+    )
+  }
+  return out
 }
 
 /** 矩形轮廓 */

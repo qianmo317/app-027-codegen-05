@@ -17,6 +17,7 @@ import {
 } from '@/logic/exporters'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
+import { listVersions, saveVersion, versionState } from '@/logic/versions'
 
 const route = useRoute()
 const router = useRouter()
@@ -138,8 +139,60 @@ function mime(): string {
 function doDownload(): void {
   const p = project.value
   if (!p || !stats.value) return
+  // 每导出一版就把整场刀路连同当时参数 / 连刀点设置一起存档
+  archiveVersion(true)
   const name = `${sanitizeFilename(p.name)}_${cfg.value.format}.${ext()}`
   downloadText(name, stats.value.text, mime())
+}
+
+// ---------------- 刀路版本存档 ----------------
+const archiveMsg = ref('')
+const archiveTick = ref(0)
+
+const versionCount = computed(() => {
+  void archiveTick.value
+  return listVersions(projectId.value).length
+})
+
+const lastVersion = computed(() => {
+  void archiveTick.value
+  return listVersions(projectId.value)[0] ?? null
+})
+
+function archiveVersion(fromDownload: boolean): void {
+  const p = project.value
+  if (!p) return
+  const d = jobData.value
+  if (!d) return
+  const out = saveVersion(p.id, {
+    job: d.job,
+    settings: p.settings,
+    exportCfg: p.export,
+    sheet: p.sheet,
+    material: material.value,
+    batch: p.batch,
+    exportFormat: cfg.value.format,
+  })
+  archiveTick.value += 1
+  if (out.status === 'saved') {
+    archiveMsg.value = out.duplicated
+      ? `与上一版刀路/参数完全一致，未重复存档（${out.version.label}）`
+      : `${fromDownload ? '已下载并存档' : '已存档'}：${out.version.label}，可前往版本对照页比对`
+  } else if (out.status === 'empty') {
+    archiveMsg.value = '当前没有刀路可存档'
+  } else {
+    archiveMsg.value = `存档失败：${out.message}`
+  }
+}
+
+function saveCurrentVersion(): void {
+  archiveVersion(false)
+}
+
+function fmtArchiveTime(ts: number): string {
+  const d = new Date(ts)
+  const p2 = (n: number) => String(n).padStart(2, '0')
+  return `${d.getMonth() + 1}/${d.getDate()} ${p2(d.getHours())}:${p2(d.getMinutes())}`
 }
 
 // ---------------- A4 检查图 ----------------
@@ -302,6 +355,24 @@ function downloadA4(): void {
 
         <div class="section">
           <div class="section-title">
+            刀路版本存档
+            <span class="spacer"></span>
+            <button class="tiny" @click="router.push(`/compare/${project.id}`)">打开版本对照 →</button>
+          </div>
+          <div class="hint" style="margin-bottom: 6px">
+            每次下载都会把这一版的整场刀路（多形状 / 多图层）连同切割参数、连刀点设置一起冻结存档；之后改参数再导出，可在「版本对照」里逐段比出切出来哪里不一样。
+          </div>
+          <div class="btn-row">
+            <button class="tiny primary" @click="saveCurrentVersion">把当前刀路存一版</button>
+            <span class="tag mono">已存 {{ versionCount }} 版</span>
+            <span v-if="lastVersion" class="hint">最近：{{ lastVersion.label }}（{{ fmtArchiveTime(lastVersion.createdAt) }}）</span>
+          </div>
+          <div v-if="archiveMsg" class="hint archive-msg">{{ archiveMsg }}</div>
+          <div v-if="versionState.lastError" class="hint archive-err">{{ versionState.lastError }}</div>
+        </div>
+
+        <div class="section">
+          <div class="section-title">
             文件预览（前 60 行 / 共 {{ lineCount }} 行）
             <span class="spacer"></span>
             <button class="tiny" @click="doDownload">下载</button>
@@ -364,5 +435,15 @@ function downloadA4(): void {
 .print-area .sheet :deep(svg) {
   display: block;
   margin: 0 auto;
+}
+
+.archive-msg {
+  margin-top: 5px;
+  color: var(--ok);
+}
+
+.archive-err {
+  margin-top: 5px;
+  color: var(--err);
 }
 </style>

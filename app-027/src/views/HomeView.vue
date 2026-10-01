@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { PATTERN_CATEGORIES, PATTERN_LIBRARY, fetchPatternText, type PatternEntry } from '@/data/patterns'
 import { store, state } from '@/logic/store'
+import { dropProjectVersions } from '@/logic/versions'
 import type { Shape } from '@/logic/types'
 import { DEFAULT_CUT_SETTINGS } from '@/logic/types'
 
@@ -95,7 +96,10 @@ function onDrop(e: DragEvent): void {
 }
 
 function remove(id: string, name: string): void {
-  if (confirm(`删除项目「${name}」？该操作不可撤销。`)) store.deleteProject(id)
+  if (confirm(`删除项目「${name}」？该操作不可撤销，项目的刀路版本存档也会一并删除。`)) {
+    store.deleteProject(id)
+    dropProjectVersions(id)
+  }
   if (state.lastError) error.value = state.lastError
 }
 

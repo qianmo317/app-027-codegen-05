@@ -31,6 +31,7 @@ const contextLabel = computed(() => {
         <RouterLink v-if="project" :to="`/design/${project.id}`">编辑</RouterLink>
         <RouterLink v-if="project" :to="`/layout/${project.id}`">排版</RouterLink>
         <RouterLink v-if="project" :to="`/export/${project.id}`">导出</RouterLink>
+        <RouterLink v-if="project" :to="`/compare/${project.id}`">版本对照</RouterLink>
         <RouterLink to="/materials">材料预设</RouterLink>
         <RouterLink to="/help">上机指南</RouterLink>
       </nav>
