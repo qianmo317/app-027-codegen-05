@@ -17,6 +17,7 @@ import {
 } from '@/logic/exporters'
 import { downloadText, sanitizeFilename } from '@/logic/download'
 import { boundsOf } from '@/logic/geometry'
+import { captureVersion, saveVersion } from '@/logic/versions'
 
 const route = useRoute()
 const router = useRouter()
@@ -138,8 +139,27 @@ function mime(): string {
 function doDownload(): void {
   const p = project.value
   if (!p || !stats.value) return
+  archiveVersion()
   const name = `${sanitizeFilename(p.name)}_${cfg.value.format}.${ext()}`
   downloadText(name, stats.value.text, mime())
+}
+
+// ---------------- 刀路版本存档 ----------------
+const versionMsg = ref('')
+
+function archiveVersion(): void {
+  const p = project.value
+  if (!p || !jobData.value || !material.value) return
+  const snap = captureVersion(p, jobData.value, material.value, cfg.value.format.toUpperCase())
+  const res = saveVersion(p.id, snap)
+  versionMsg.value = res.reused
+    ? `与已存版本几何/参数完全相同，已刷新「${res.version.label}」时间，不重复占版本。`
+    : `已存档为「${res.version.label}」，连同切割参数与连刀点设置一起保存，可去版本对照页比对。`
+}
+
+function saveVersionOnly(): void {
+  if (!stats.value) return
+  archiveVersion()
 }
 
 // ---------------- A4 检查图 ----------------
@@ -210,9 +230,15 @@ function downloadA4(): void {
       <div class="panel-head">
         导出设置
         <span class="spacer"></span>
+        <RouterLink class="tiny" :to="`/compare/${project.id}`">版本对照 →</RouterLink>
+        <button class="tiny" :disabled="!stats" @click="saveVersionOnly" title="只存档当前刀路版本，不下载文件">存为版本</button>
         <button class="tiny primary" @click="doDownload">下载 {{ cfg.format.toUpperCase() }}</button>
       </div>
       <div class="panel-body">
+        <div v-if="versionMsg" class="archive-msg">{{ versionMsg }}</div>
+        <div class="hint archive-hint">
+          每次下载（或点「存为版本」）都会把这一整场刀路连同当时的切割参数、连刀点设置、材料与排版一起存档；改参数后再导出即可两版对照。
+        </div>
         <div class="section">
           <div class="section-title">格式与单位</div>
           <div class="field-row">
@@ -364,5 +390,19 @@ function downloadA4(): void {
 .print-area .sheet :deep(svg) {
   display: block;
   margin: 0 auto;
+}
+
+.archive-msg {
+  border: 1px solid #2e7d4f;
+  background: rgba(71, 192, 122, 0.1);
+  color: #83dca7;
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.archive-hint {
+  margin-bottom: 8px;
 }
 </style>

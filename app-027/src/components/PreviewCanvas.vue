@@ -7,6 +7,7 @@ import type { CutStep } from '@/logic/order'
 import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
+import type { OverlayBridge, OverlayPath, OverlayTravel } from './overlay'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
@@ -28,6 +29,14 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 版本对照叠加层：额外绘制的折线（坐标为原始 mm，按 placement 摆放） */
+    overlayPaths?: OverlayPath[]
+    overlayBridges?: OverlayBridge[]
+    overlayTravels?: OverlayTravel[]
+    /** 隐藏内置刀路/轮廓层（对照模式只显示叠加层时使用） */
+    hideBuiltin?: boolean
+    /** 定位标记（点清单条目后跳到该点） */
+    focusMarker?: Pt | null
   }>(),
   {
     job: null,
@@ -43,6 +52,11 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    overlayPaths: () => [],
+    overlayBridges: () => [],
+    overlayTravels: () => [],
+    hideBuiltin: false,
+    focusMarker: null,
   },
 )
 
@@ -418,6 +432,38 @@ const simPts = computed(() => {
   return props.simPath.map((p) => toPx(pl(p)))
 })
 
+// ---------------- 版本对照叠加层 ----------------
+
+const overlayPathData = computed(() =>
+  props.overlayPaths.map((o) => ({
+    ...o,
+    d: pointsToD(o.points.map(pl), !!o.closed),
+  })),
+)
+
+const overlayBridgeData = computed(() =>
+  props.overlayBridges.map((b) => ({ ...b, atPx: toPx(pl(b.at)), endPx: toPx(pl(b.end)) })),
+)
+
+const overlayTravelData = computed(() =>
+  props.overlayTravels.map((t) => ({ ...t, fromPx: toPx(pl(t.from)), toPx: toPx(pl(t.to)) })),
+)
+
+const focusMarkerPx = computed(() => (props.focusMarker ? toPx(pl(props.focusMarker)) : null))
+const flash = ref(false)
+let flashTimer: number | null = null
+
+watch(
+  () => props.focusMarker,
+  () => {
+    flash.value = true
+    if (flashTimer !== null) window.clearTimeout(flashTimer)
+    flashTimer = window.setTimeout(() => {
+      flash.value = false
+    }, 1600)
+  },
+)
+
 const simHead = computed(() => {
   if (simPts.value.length === 0 || props.simIndex < 0) return null
   return simPts.value[Math.min(props.simIndex, simPts.value.length - 1)]
@@ -452,7 +498,24 @@ const gridLines = computed(() => {
   return { v, h, label }
 })
 
-defineExpose({ fit, zoomBy, zoom, focusContour })
+defineExpose({ fit, zoomBy, zoom, focusContour, focusPoint })
+
+/** 定位到任意 mm 坐标点（版本对照清单点击跳转） */
+function focusPoint(p: Pt, zoomLevel?: number): void {
+  const z = zoomLevel ?? Math.min(12, Math.max(zoom.value, 4))
+  zoom.value = z
+  panX.value = size.value.w / 2 - p.x * z
+  panY.value = size.value.h / 2 - p.y * z
+}
+
+/** 屏幕坐标下的跳刀箭头（三角形指向落点） */
+function arrowHead(from: Pt, to: Pt, size = 7): string {
+  const ang = Math.atan2(to.y - from.y, to.x - from.x)
+  const p1 = to
+  const p2 = { x: to.x - size * Math.cos(ang - 0.42), y: to.y - size * Math.sin(ang - 0.42) }
+  const p3 = { x: to.x - size * Math.cos(ang + 0.42), y: to.y - size * Math.sin(ang + 0.42) }
+  return `${p1.x},${p1.y} ${p2.x},${p2.y} ${p3.x},${p3.y}`
+}
 
 function focusContour(id: string): void {
   for (const s of props.shapes) {
@@ -522,7 +585,7 @@ function focusContour(id: string): void {
         />
 
         <!-- 成品轮廓 -->
-        <g v-if="mode === 'outline' || mode === 'bridge' || !job" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g v-if="!hideBuiltin && (mode === 'outline' || mode === 'bridge' || !job)" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path
             v-for="c in outlineContours"
             :key="c.id"
@@ -535,7 +598,7 @@ function focusContour(id: string): void {
         </g>
 
         <!-- 刀路（切割顺序） -->
-        <g v-if="mode === 'toolpath'" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g v-if="!hideBuiltin && mode === 'toolpath'" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path
             v-for="p in cutPaths"
             :key="`cut${p.i}`"
@@ -547,12 +610,12 @@ function focusContour(id: string): void {
         </g>
 
         <!-- 跳刀 -->
-        <g v-if="showTravel && mode === 'toolpath'" stroke="#7f8fa3" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke">
+        <g v-if="!hideBuiltin && showTravel && mode === 'toolpath'" stroke="#7f8fa3" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke">
           <line v-for="(t, i) in travels" :key="`t${i}`" :x1="t.x1" :y1="t.y1" :x2="t.x2" :y2="t.y2" />
         </g>
 
         <!-- 顺序编号 -->
-        <g v-if="mode === 'toolpath' && showNumbers">
+        <g v-if="!hideBuiltin && mode === 'toolpath' && showNumbers">
           <g v-for="n in numbers" :key="`n${n.i}`">
             <circle :cx="n.x" :cy="n.y" :r="7 / zoom" fill="#12161b" stroke="#ff8f3c" :stroke-width="1.4 / zoom" />
             <text
@@ -569,7 +632,7 @@ function focusContour(id: string): void {
         </g>
 
         <!-- 连刀点缺口标记 -->
-        <g v-if="mode === 'bridge'">
+        <g v-if="!hideBuiltin && mode === 'bridge'">
           <g v-for="(b, i) in bridges" :key="`b${i}`">
             <circle :cx="b.x" :cy="b.y" :r="2.4 / zoom" fill="#47c07a" />
             <circle :cx="b.end.x" :cy="b.end.y" :r="2.4 / zoom" fill="#47c07a" />
@@ -581,6 +644,58 @@ function focusContour(id: string): void {
         <g v-if="simPts.length > 0" fill="none">
           <path :d="donePath" stroke="#47c07a" stroke-width="1.6" vector-effect="non-scaling-stroke" />
           <circle v-if="simHead" :cx="simHead.x" :cy="simHead.y" :r="5 / zoom" fill="#ff6b6b" stroke="#fff" :stroke-width="1 / zoom" />
+        </g>
+
+        <!-- 版本对照：跳刀叠加层 -->
+        <g fill="none">
+          <g v-for="t in overlayTravelData" :key="t.key">
+            <line
+              :x1="t.fromPx.x"
+              :y1="t.fromPx.y"
+              :x2="t.toPx.x"
+              :y2="t.toPx.y"
+              :stroke="t.color"
+              :stroke-width="t.emphasis ? 2 : 1.2"
+              :stroke-dasharray="t.dashed === false ? '' : '5 4'"
+              :opacity="t.emphasis ? 1 : 0.75"
+              vector-effect="non-scaling-stroke"
+            />
+            <polygon
+              v-if="t.emphasis"
+              :points="arrowHead(t.fromPx, t.toPx)"
+              :fill="t.color"
+            />
+          </g>
+        </g>
+
+        <!-- 版本对照：刀路叠加层 -->
+        <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path
+            v-for="o in overlayPathData"
+            :key="o.key"
+            :d="o.d"
+            :stroke="o.color"
+            :stroke-width="o.emphasis ? 2.6 : o.width ?? 1.4"
+            :stroke-dasharray="o.dash ?? ''"
+            :opacity="o.opacity ?? 1"
+            vector-effect="non-scaling-stroke"
+          />
+        </g>
+
+        <!-- 版本对照：连刀点叠加层 -->
+        <g v-if="overlayBridgeData.length > 0">
+          <g v-for="b in overlayBridgeData" :key="b.key">
+            <line
+              :x1="b.atPx.x"
+              :y1="b.atPx.y"
+              :x2="b.endPx.x"
+              :y2="b.endPx.y"
+              :stroke="b.color"
+              :stroke-width="(b.emphasis ? 2 : 1.2) / zoom"
+            />
+            <circle :cx="b.atPx.x" :cy="b.atPx.y" :r="(b.emphasis ? 3 : 2) / zoom" :fill="b.color" />
+            <circle :cx="b.endPx.x" :cy="b.endPx.y" :r="(b.emphasis ? 3 : 2) / zoom" :fill="b.color" />
+          </g>
         </g>
 
         <!-- 绘制中的草稿 -->
@@ -623,6 +738,22 @@ function focusContour(id: string): void {
         <text :x="m.center.x" :y="m.center.y + 68" font-size="10" text-anchor="middle" fill="#93a3b4" font-family="Plotter Mono, monospace">
           {{ m.widthMm.toFixed(2) }}mm ×8
         </text>
+      </g>
+
+      <!-- 定位标记（点差异清单跳转） -->
+      <g v-if="focusMarkerPx">
+        <circle
+          :cx="focusMarkerPx.x"
+          :cy="focusMarkerPx.y"
+          r="10"
+          fill="none"
+          stroke="#ffe14d"
+          stroke-width="2"
+          :class="flash ? 'marker-pulse' : ''"
+        />
+        <circle :cx="focusMarkerPx.x" :cy="focusMarkerPx.y" r="2.5" fill="#ffe14d" />
+        <line :x1="focusMarkerPx.x - 14" :y1="focusMarkerPx.y" :x2="focusMarkerPx.x + 14" :y2="focusMarkerPx.y" stroke="#ffe14d" stroke-width="1" opacity="0.8" />
+        <line :x1="focusMarkerPx.x" :y1="focusMarkerPx.y - 14" :x2="focusMarkerPx.x" :y2="focusMarkerPx.y + 14" stroke="#ffe14d" stroke-width="1" opacity="0.8" />
       </g>
     </svg>
 
@@ -680,5 +811,21 @@ function focusContour(id: string): void {
   padding: 0 4px;
   min-width: 42px;
   text-align: right;
+}
+
+.marker-pulse {
+  animation: marker-pulse 0.8s ease-in-out 2;
+}
+
+@keyframes marker-pulse {
+  0%,
+  100% {
+    r: 10;
+    opacity: 1;
+  }
+  50% {
+    r: 18;
+    opacity: 0.35;
+  }
 }
 </style>

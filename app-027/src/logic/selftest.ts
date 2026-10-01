@@ -1,12 +1,24 @@
 import { PATTERN_LIBRARY, fetchPatternText } from '@/data/patterns'
 import { defaultMaterials } from '@/data/materials'
-import { DEFAULT_CUT_SETTINGS, type CutSettings, type MaterialPreset, type Pt, type Shape } from './types'
+import { DEFAULT_CUT_SETTINGS, type CutSettings, type MaterialPreset, type Project, type Pt, type Shape } from './types'
 import { cleanupContours } from './cleanup'
 import { importSvgText } from './importer'
-import { computeShape } from './pipeline'
+import { computeShape, type ComputedShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import {
+  buildDiffReport,
+  captureVersion,
+  deleteVersion,
+  diffVersions,
+  fmtSignedMm,
+  fmtSignedSeconds,
+  listVersions,
+  planPrune,
+  VersionInUseError,
+  versionState,
+} from './versions'
 
 export type CheckResult = {
   id: string
@@ -453,8 +465,200 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     ),
   )
 
+  // ---------- 10. 版本对照：存档 / 差异 / 三个总数之差 / 整理保护 ----------
+  const versionShape: Shape = {
+    id: 'st_ver',
+    name: '版本对照用例',
+    layer: 0,
+    contours: [
+      rectContour('st_ver_outer', 0, 0, 60, 60),
+      rectContour('st_ver_hole', 20, 20, 10, 10),
+      {
+        id: 'st_ver_frag',
+        points: [
+          { x: 45, y: 45 },
+          { x: 47, y: 45 },
+          { x: 47, y: 47 },
+          { x: 45, y: 47 },
+        ],
+        closed: true,
+        area: 4,
+        length: 8,
+        holes: [],
+        bridges: [],
+        warnings: [],
+      },
+    ],
+  }
+  const project: Project = {
+    id: 'st_ver_proj',
+    name: '版本对照自检',
+    createdAt: 0,
+    updatedAt: 0,
+    shapes: [versionShape],
+    settings: { ...settings },
+    export: { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 },
+    sheet: { widthMm: 210, heightMm: 297, name: 'A4 纵向' },
+    materialId: mat.id,
+    layerNames: ['图层 1'],
+    batch: { enabled: false, rows: 2, cols: 2, gapXMm: 5, gapYMm: 5, sharedEdge: false, mode: 'repeat' },
+  }
+
+  function jobOfProject(p: Project) {
+    const comp = computeShape(p.shapes[0], p.settings, mat)
+    const map = new Map<string, ComputedShape>([[p.shapes[0].id, comp]])
+    return buildJob(p.shapes, map, [0], { sharedEdge: false, start: { x: 0, y: 0 } })
+  }
+
+  const jobA = jobOfProject(project)
+  const compA = computeShape(project.shapes[0], project.settings, mat)
+  const snapA = captureVersion(
+    project,
+    { job: jobA, shape: null, isBatch: false, computed: new Map([[project.shapes[0].id, compA]]) },
+    mat,
+    'PLT',
+    1000,
+  )
+  const snapSame = captureVersion(
+    project,
+    { job: jobA, shape: null, isBatch: false, computed: new Map([[project.shapes[0].id, compA]]) },
+    mat,
+    'PLT',
+    2000,
+  )
+  const dedupOk = snapSame.geometryKey === snapA.geometryKey && snapSame.settingsKey === snapA.settingsKey
+
+  // B 版：连刀点宽度改变（缺口段位置与宽度都变 → 几何 + 参数差异）
+  const projectB: Project = JSON.parse(JSON.stringify(project))
+  projectB.settings.bridgeWidthMm = settings.bridgeWidthMm + 0.3
+  const jobB = jobOfProject(projectB)
+  const compB = computeShape(projectB.shapes[0], projectB.settings, mat)
+  const snapB = captureVersion(
+    projectB,
+    { job: jobB, shape: null, isBatch: false, computed: new Map([[projectB.shapes[0].id, compB]]) },
+    mat,
+    'PLT',
+    3000,
+  )
+  const vdiff = diffVersions(snapA, snapB)
+
+  const hasCutOnly = vdiff.rowsByType.cut_only_a + vdiff.rowsByType.cut_only_b > 0
+  const hasBridgeRow = vdiff.rows.some(
+    (r) => r.type === 'bridge_moved' || r.type === 'bridge_only_a' || r.type === 'bridge_only_b' || r.type === 'bridge_width',
+  )
+  const paramOk = vdiff.paramChanges.some((c) => c.label.includes('连刀点宽度'))
+  const totalsOk =
+    Math.abs(vdiff.totals.dCut - (snapB.stats.cutLengthMm - snapA.stats.cutLengthMm)) < 1e-6 &&
+    Math.abs(vdiff.totals.dTravel - (snapB.stats.travelMm - snapA.stats.travelMm)) < 1e-6 &&
+    Math.abs(vdiff.totals.dSec - (snapB.stats.estimatedSeconds - snapA.stats.estimatedSeconds)) < 1e-6
+  const everyRowHasWhere = vdiff.rows.every(
+    (r) => Number.isFinite(r.where.x) && Number.isFinite(r.where.y) && r.title && r.detail,
+  )
+  checks.push(
+    ok(
+      'version-diff',
+      '版本对照：改连刀点参数后两版刀路可比对（独有切割段着色、连刀点变化单列、清单条目带图上坐标）',
+      hasCutOnly && hasBridgeRow && paramOk && totalsOk && everyRowHasWhere && dedupOk,
+      `独有切割段 ${vdiff.rowsByType.cut_only_a + vdiff.rowsByType.cut_only_b} 行｜连刀点变化 ${
+        vdiff.rowsByType.bridge_moved + vdiff.rowsByType.bridge_width + vdiff.rowsByType.bridge_only_a + vdiff.rowsByType.bridge_only_b
+      } 行｜跳刀走向 ${vdiff.rowsByType.travel_changed} 行｜参数差异 ${vdiff.paramChanges.length} 项｜重复存档去重=${dedupOk}`,
+    ),
+  )
+
+  // 三个总数之差
+  const report = buildDiffReport(vdiff)
+  const reportOk =
+    report.includes('# 刀路版本对照清单') &&
+    report.includes('刀路总长') &&
+    report.includes('跳刀总长') &&
+    report.includes('预计切割时间') &&
+    (vdiff.rows.length === 0 ? report.includes('没有差异') : true)
+  checks.push(
+    ok(
+      'version-report',
+      '差异清单可导出为文件（含刀路总长 / 跳刀总长 / 预计切割时间三个差值）',
+      reportOk && report.includes(Math.abs(vdiff.totals.dCut).toFixed(1)) && report.includes(Math.abs(vdiff.totals.dTravel).toFixed(1)),
+      `清单 ${report.length} 字符，${vdiff.rows.length} 条明细；三个总数之差：${fmtSignedMm(vdiff.totals.dCut)} / ${fmtSignedMm(
+        vdiff.totals.dTravel,
+      )} / ${fmtSignedSeconds(vdiff.totals.dSec)}`,
+    ),
+  )
+
+  // 整理保护：正在比对 / 有对照引用的旧版不许删
+  const pruneCheck = (() => {
+    const P = 'st_prune'
+    listVersions(P) // 确保懒加载
+    versionState.projects[P] = [
+      mkTestVersion(P, 'old1', 1000),
+      mkTestVersion(P, 'old2', 2000),
+      mkTestVersion(P, 'new1', 3000),
+    ]
+    versionState.comparisons[P] = [{ id: 'c1', aId: 'old1', bId: 'new1', createdAt: '' }]
+    const plan = planPrune(P, 1, ['old1', 'new1'])
+    const protectedIds = plan.protectedItems.map((x) => x.version.id)
+    const deleteIds = plan.toDelete.map((x) => x.id)
+
+    // 正在用于比对的版本不许删
+    let threwInUse = false
+    try {
+      deleteVersion(P, 'new1', ['old1', 'new1'])
+    } catch (e) {
+      threwInUse = e instanceof VersionInUseError
+    }
+    // 无 activePair 时，被已保存对照引用的版本也不许删
+    let threwReferenced = false
+    try {
+      deleteVersion(P, 'old1', null)
+    } catch (e) {
+      threwReferenced = e instanceof VersionInUseError
+    }
+    // 没被引用的旧版可删
+    deleteVersion(P, 'old2', null)
+    const remaining = listVersions(P).map((v) => v.id)
+    delete versionState.projects[P]
+    delete versionState.comparisons[P]
+    return { protectedIds, deleteIds, threwInUse, threwReferenced, remaining }
+  })()
+  checks.push(
+    ok(
+      'version-prune-protect',
+      '只留最近 N 版：删旧版前说明影响哪几次对照，正在比对/被引用的版本不删',
+      pruneCheck.protectedIds.includes('old1') &&
+        pruneCheck.deleteIds.includes('old2') &&
+        !pruneCheck.deleteIds.includes('old1') &&
+        pruneCheck.threwInUse &&
+        pruneCheck.threwReferenced &&
+        pruneCheck.remaining.includes('old1') &&
+        !pruneCheck.remaining.includes('old2'),
+      `保留最近 1 版：删除 ${pruneCheck.deleteIds.join('、') || '（无）'}；因对照 c1 引用而保留 ${pruneCheck.protectedIds.join('、')}；正在比对删除被拒=${pruneCheck.threwInUse}；被引用删除被拒=${pruneCheck.threwReferenced}`,
+    ),
+  )
+
   const totalMs = performance.now() - t0
   return { checks, summaries, totalMs }
+}
+
+function mkTestVersion(projectId: string, id: string, createdAt: number): import('./versions').ToolpathVersion {
+  return {
+    id,
+    projectId,
+    projectName: 't',
+    no: 1,
+    label: id,
+    createdAt,
+    note: '',
+    settings: { ...DEFAULT_CUT_SETTINGS },
+    export: { format: 'plt', unit: '0.025mm', origin: 'bottom_left', yFlip: true, scale: 1 },
+    sheet: { widthMm: 210, heightMm: 297, name: 'A4' },
+    batch: null,
+    material: { id: 'm', name: 'm', speedMmS: 40, passes: 1, force: 100 },
+    steps: [],
+    bridges: [],
+    stats: { cutLengthMm: 0, travelMm: 0, runCount: 0, bridgeCount: 0, estimatedSeconds: 0, shapeCount: 0, layerCount: 0 },
+    geometryKey: id,
+    settingsKey: id,
+    sourceFormat: 'PLT',
+  }
 }
 
 /** 矩形轮廓 */
